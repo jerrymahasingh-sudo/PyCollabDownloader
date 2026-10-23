@@ -68,3 +68,7 @@ python main.py
 * **Organized Storage**: Places downloaded MP4 files into year-based subfolders (`./downloaded_recordings/2021/`).
 * **File Integrity Verification**: Checks file size and verifies MP4 binary headers (`ftyp` magic bytes).
 * **Summary Reporting**: Exports execution details and file verification statuses to `Download_Status_Report.csv`.
+  
+## Acknowledggments
+
+* Code developed and optimized with assistance from **Gemini**.
