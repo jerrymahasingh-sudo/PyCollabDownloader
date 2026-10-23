@@ -1,4 +1,3 @@
-```markdown
 # Blackboard Collaborate Recording Downloader
 
 An automated Python tool to process Blackboard Collaborate Institutional Recording CSV/XLSX reports, download public recordings, organize files by year, and generate download verification reports.
@@ -31,14 +30,6 @@ Ensure you have Python installed on your system (Python 3.8 to 3.11 is recommend
      ```bash
      python --version
      ```
-
-
-Verify installation:
-
-```bash
-python3 --version
-
-```
 
 ---
 
