@@ -1,3 +1,7 @@
+"""
+Blackboard Collaborate Recording Downloader
+Developed with assistance from Gemini.
+"""
 import importlib
 import subprocess
 import sys
