@@ -1,0 +1,15 @@
+# Media and Output Files
+downloaded_recordings/
+*.mp4
+*.mp4.part
+
+# Output Reports & Logs
+Download_Status_Report.csv
+download_log.txt
+
+# Python Cache & Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
