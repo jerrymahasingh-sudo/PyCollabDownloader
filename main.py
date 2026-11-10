@@ -1,13 +1,3 @@
-To refactor the script for multithreaded downloads using Python's `concurrent.futures.ThreadPoolExecutor`, we will separate the job creation (parsing the reports) from execution (downloading and verifying in parallel).
-
-### Key Modifications
-
-1. **`MAX_WORKERS` setting:** Controls concurrent downloads (default set to 5–10 to saturate bandwidth without triggering strict server rate-limits).
-2. **`ThreadPoolExecutor`:** Dispatches `process_single_item` tasks concurrently across worker threads.
-3. **Thread Safety:** Uses thread-safe progress counters and logging.
-4. **`yt_dlp` Concurrent Handling:** `yt_dlp` creates unique `.part` temporary files per target path to prevent file collisons between threads.
-
-```python
 """
 Blackboard Collaborate Recording Downloader (Multithreaded)
 Developed with assistance from Gemini.
