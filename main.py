@@ -1,5 +1,5 @@
 """
-Blackboard Collaborate Recording Downloader
+Blackboard Collaborate Recording Downloader (Multithreaded + Anti-Throttling)
 Developed with assistance from Gemini.
 """
 import importlib
@@ -33,14 +33,18 @@ import gc
 import logging
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
-import yt_dlp
 
 REPORTS_DIR = Path("./Reports")
 OUTPUT_DIR = Path("./downloaded_recordings")
 STATUS_REPORT_CSV = Path("./Download_Status_Report.csv")
+
+# Optimal concurrent downloads to avoid server IP bans (5-8 recommended)
+MAX_WORKERS = 6
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,6 +57,9 @@ logging.basicConfig(
         logging.FileHandler("download_log.txt", encoding="utf-8"),
     ],
 )
+
+counter_lock = threading.Lock()
+completed_counter = 0
 
 
 def clean_name(value):
@@ -107,34 +114,149 @@ def size_bytes_to_mb(size_in_bytes):
 
 
 def download_public_recording(url, destination):
-    """Download public recording stream directly using yt-dlp."""
-    temp_file_path = str(destination.with_suffix(".mp4.part"))
+    """
+    Spawns an isolated yt-dlp process to prevent memory leaks, TCP socket degradation,
+    and CDN throttling across long download queues.
+    """
+    thread_id = threading.get_ident()
+    temp_file_path = str(destination.with_suffix(f".part_{thread_id}"))
 
-    ydl_opts = {
-        "outtmpl": temp_file_path,
-        "quiet": True,
-        "nocheckcertificate": True,
-        "retries": 10,
-        "fragment_retries": 10,
-        "continuedl": False,
-    }
+    # Command line args for fresh process + aggressive retry & chunking
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        url,
+        "-o",
+        temp_file_path,
+        "--quiet",
+        "--no-warnings",
+        "--no-check-certificate",
+        "--retries",
+        "5",
+        "--fragment-retries",
+        "5",
+        "--concurrent-fragments",
+        "4",  # Speed up stream fragment downloads
+        "--socket-timeout",
+        "15",  # Drop hung sockets quickly
+    ]
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        # Run isolated process per file
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=1800)
 
         temp_path = Path(temp_file_path)
-        if temp_path.exists():
+        if result.returncode == 0 and temp_path.exists():
             temp_path.replace(destination)
             return True, "Downloaded_Successfully"
+        else:
+            temp_path.unlink(missing_ok=True)
+            err_msg = result.stderr.strip() or "Unknown process error"
+            return False, f"Download_Failed: {err_msg[:100]}"
+
+    except subprocess.TimeoutExpired:
+        Path(temp_file_path).unlink(missing_ok=True)
+        return False, "Download_Failed: Timeout (30 mins exceeded)"
     except Exception as e:
         Path(temp_file_path).unlink(missing_ok=True)
         return False, f"Download_Failed: {str(e)[:100]}"
 
-    return False, "Download_Failed_Unknown"
+
+def process_single_item(item_data, total_items):
+    """Worker function executed per thread."""
+    global completed_counter
+
+    report_name = item_data["report_name"]
+    year_folder = item_data["year_folder"]
+    context_id = item_data["context_id"]
+    session_name = item_data["session_name"]
+    recording_name = item_data["recording_name"]
+    raw_url = item_data["raw_url"]
+    filename = item_data["filename"]
+    destination = item_data["destination"]
+    old_root_path = item_data["old_root_path"]
+
+    record = {
+        "Report_File": report_name,
+        "Year": year_folder,
+        "ContextIdentifier": context_id,
+        "SessionName": session_name,
+        "RecordingName": recording_name,
+        "RecordingLink": raw_url,
+        "Local_Path": str(destination),
+        "File_Size_MB": 0.0,
+        "Status": "Pending",
+        "Verification_Status": "Unverified",
+    }
+
+    with counter_lock:
+        completed_counter += 1
+        current_idx = completed_counter
+        if current_idx % 10 == 0:
+            gc.collect()
+
+    # Invalid or missing link check
+    if not raw_url or raw_url.lower() == "nan" or not raw_url.startswith("http"):
+        record["Status"] = "Skipped_Invalid_URL"
+        record["Verification_Status"] = "N/A"
+        return record
+
+    # Determine existing file location
+    target_path = None
+    if destination.exists():
+        target_path = destination
+    elif old_root_path.exists():
+        target_path = old_root_path
+
+    # Skip & Verification step for already existing files
+    if target_path:
+        is_valid, v_status = verify_file_integrity(target_path)
+        file_size_mb = size_bytes_to_mb(target_path.stat().st_size)
+
+        if is_valid:
+            logging.info(
+                "[%d/%d] Skipping existing & verified file (%s): %s",
+                current_idx,
+                total_items,
+                year_folder,
+                filename,
+            )
+            record["Status"] = "Already_Exists"
+            record["Verification_Status"] = v_status
+            record["File_Size_MB"] = round(file_size_mb, 2)
+            record["Local_Path"] = str(target_path)
+            return record
+
+    # Perform Download
+    logging.info(
+        "[%d/%d] Downloading (%s): %s",
+        current_idx,
+        total_items,
+        year_folder,
+        filename,
+    )
+    success, status_msg = download_public_recording(raw_url, destination)
+
+    # Verification step post-download
+    if success:
+        is_valid, v_status = verify_file_integrity(destination)
+        file_size_mb = size_bytes_to_mb(destination.stat().st_size)
+
+        record["Status"] = status_msg
+        record["Verification_Status"] = v_status
+        record["File_Size_MB"] = round(file_size_mb, 2)
+    else:
+        record["Status"] = status_msg
+        record["Verification_Status"] = "Failed_Verification"
+
+    return record
 
 
 def main():
+    global completed_counter
+    completed_counter = 0
+
     report_files = [
         f
         for f in REPORTS_DIR.iterdir()
@@ -147,11 +269,11 @@ def main():
 
     logging.info("Found %d report file(s) in %s", len(report_files), REPORTS_DIR)
 
-    tracking_results = []
-    total_processed = 0
+    tasks = []
 
+    # Build queue of items to download
     for report_path in report_files:
-        logging.info("--- Processing report file: %s ---", report_path.name)
+        logging.info("--- Extracting items from report: %s ---", report_path.name)
 
         if report_path.suffix.lower() == ".csv":
             df = pd.read_csv(report_path, encoding="utf-8-sig")
@@ -159,7 +281,6 @@ def main():
             df = pd.read_excel(report_path)
 
         for index, row in df.iterrows():
-            total_processed += 1
             raw_url = str(row.get("RecordingLink", "")).strip()
 
             recording_created, year_folder = extract_year_and_date(
@@ -183,82 +304,42 @@ def main():
             destination = year_dir / filename
             old_root_path = OUTPUT_DIR / filename
 
-            # Tracking record template
-            record = {
-                "Report_File": report_path.name,
-                "Year": year_folder,
-                "ContextIdentifier": context_id,
-                "SessionName": session_name,
-                "RecordingName": recording_name,
-                "RecordingLink": raw_url,
-                "Local_Path": str(destination),
-                "File_Size_MB": 0.0,
-                "Status": "Pending",
-                "Verification_Status": "Unverified",
-            }
-
-            # Invalid or missing link check
-            if (
-                not raw_url
-                or raw_url.lower() == "nan"
-                or not raw_url.startswith("http")
-            ):
-                record["Status"] = "Skipped_Invalid_URL"
-                record["Verification_Status"] = "N/A"
-                tracking_results.append(record)
-                continue
-
-            # Determine existing file location (year subfolder or old root folder)
-            target_path = None
-            if destination.exists():
-                target_path = destination
-            elif old_root_path.exists():
-                target_path = old_root_path
-
-            # Skip & Verification step for already existing files
-            if target_path:
-                is_valid, v_status = verify_file_integrity(target_path)
-                file_size_mb = size_bytes_to_mb(target_path.stat().st_size)
-
-                if is_valid:
-                    logging.info(
-                        "[%d] Skipping existing & verified file (%s): %s",
-                        total_processed,
-                        year_folder,
-                        filename,
-                    )
-                    record["Status"] = "Already_Exists"
-                    record["Verification_Status"] = v_status
-                    record["File_Size_MB"] = round(file_size_mb, 2)
-                    record["Local_Path"] = str(target_path)
-                    tracking_results.append(record)
-                    continue
-
-            # Perform Download
-            logging.info(
-                "[%d] Downloading (%s): %s",
-                total_processed,
-                year_folder,
-                filename,
+            tasks.append(
+                {
+                    "report_name": report_path.name,
+                    "year_folder": year_folder,
+                    "context_id": context_id,
+                    "session_name": session_name,
+                    "recording_name": recording_name,
+                    "raw_url": raw_url,
+                    "filename": filename,
+                    "destination": destination,
+                    "old_root_path": old_root_path,
+                }
             )
-            success, status_msg = download_public_recording(raw_url, destination)
 
-            # Verification step post-download
-            if success:
-                is_valid, v_status = verify_file_integrity(destination)
-                file_size_mb = size_bytes_to_mb(destination.stat().st_size)
+    total_items = len(tasks)
+    logging.info(
+        "Starting multithreaded processing with %d worker threads for %d tasks.",
+        MAX_WORKERS,
+        total_items,
+    )
 
-                record["Status"] = status_msg
-                record["Verification_Status"] = v_status
-                record["File_Size_MB"] = round(file_size_mb, 2)
-            else:
-                record["Status"] = status_msg
-                record["Verification_Status"] = "Failed_Verification"
+    tracking_results = []
 
-            tracking_results.append(record)
+    # Execute concurrent downloads
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(process_single_item, item, total_items)
+            for item in tasks
+        ]
 
-            if total_processed % 10 == 0:
-                gc.collect()
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                tracking_results.append(result)
+            except Exception as e:
+                logging.error("Unhandled error during processing: %s", e)
 
     # Save summary status CSV report
     summary_df = pd.DataFrame(tracking_results)
